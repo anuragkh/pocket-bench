@@ -76,7 +76,7 @@ def _copy_results(logger, result):
 
 
 def _pocket_write_buffer(p, job_id, lambda_id, num_ops, src, size):
-    with open('pocket_write_%s.txt' % lambda_id) as output:
+    with open('pocket_write_%s.txt' % lambda_id, 'w') as output:
         for i in xrange(num_ops):
             dst_filename = 'tmp-' + lambda_id + '-' + str(i)
             t0 = time.time()
@@ -89,7 +89,7 @@ def _pocket_write_buffer(p, job_id, lambda_id, num_ops, src, size):
 
 
 def _pocket_read_buffer(p, job_id, lambda_id, num_ops, size):
-    with open('pocket_read_%s.txt' % lambda_id) as output:
+    with open('pocket_read_%s.txt' % lambda_id, 'w') as output:
         text_back = " " * size
         for i in xrange(num_ops):
             dst_filename = 'tmp-' + lambda_id + '-' + str(i)
