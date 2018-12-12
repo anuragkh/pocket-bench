@@ -138,7 +138,7 @@ def lambda_handler(event, context):
     if "read" in mode:
         _pocket_read_buffer(p, job_id, lambda_id, num_ops, object_size)
 
-    pocket.close(p)
+    # pocket.close(p)
 
     _copy_results(logger, "pocket_write_%s.txt" % lambda_id)
     _copy_results(logger, "pocket_read_%s.txt" % lambda_id)
