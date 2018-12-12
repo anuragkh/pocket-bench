@@ -14,24 +14,16 @@ from multiprocessing import Process
 
 import boto3
 from botocore.exceptions import ClientError
-from six.moves import configparser
 
+import pocket
 from handler import lambda_handler, bytes_to_str, b
 
 iam_client = boto3.client('iam')
 lambda_client = boto3.client('lambda')
 function_name = 'StorageBenchmark'
+job_ids = {}
 
-NUM_OPS = 2000
-MAX_DATA_SET_SIZE = 2147483648
-
-
-def num_ops(system, value_size):
-    if system == "dynamodb":
-        return min(2 * NUM_OPS, int(MAX_DATA_SET_SIZE / value_size))
-    elif system == "redis" or system == "mmux":
-        return min(50 * NUM_OPS, int(MAX_DATA_SET_SIZE / value_size))
-    return min(NUM_OPS, int(MAX_DATA_SET_SIZE / value_size))
+DEFAULT_NUM_OPS = 50000
 
 
 def create_function(name):
@@ -58,10 +50,15 @@ def create_function(name):
     print('Created function: {}'.format(resp))
 
 
-def parse_ini(section, conf_file):
-    config = configparser.ConfigParser()
-    config.read(conf_file)
-    return dict(config.items(section))
+def register_pocket_job(job_name="job-0"):
+    if job_name not in job_ids:
+        job_ids[job_name] = pocket.register_job(job_name)
+    return job_ids[job_name]
+
+
+def deregister_pocket_jobs():
+    for job in job_ids:
+        pocket.deregister_job(job_ids[job])
 
 
 def invoke_lambda(e):
@@ -74,13 +71,12 @@ def invoke_locally(e):
     return f
 
 
-def invoke(args, mode, warm_up, batch_id=str(0), lambda_id=str(0)):
+def invoke(args, mode, batch_id=str(0), lambda_id=str(0)):
     e = dict(
         host=args.host,
         port=args.port,
         object_size=args.obj_size,
         num_ops=args.num_ops,
-        warm_up=warm_up,
         mode=mode,
         batch_id=batch_id,
         lambda_id=lambda_id
@@ -92,7 +88,7 @@ def invoke(args, mode, warm_up, batch_id=str(0), lambda_id=str(0)):
 
 
 def invoke_n(args, mode, n, batch_size=1):
-    return [invoke(args, mode, 0, str(i / batch_size), str(i)) for i in range(n)]
+    return [invoke(args, mode, register_pocket_job("job-%s" % (i / batch_size)), str(i)) for i in range(n)]
 
 
 def is_socket_valid(socket_instance):
@@ -163,7 +159,7 @@ def log_worker(s, num_connections=1, log=True):
                         print_logs(r, msg)
 
 
-def control_worker(s, workers_per_trigger=1, trigger_count=1, trigger_period=0, log=True):
+def control_worker(s, batch_size=1, num_batches=1, batch_delay=0, log=True):
     inputs = [s]
     outputs = []
     ready = []
@@ -192,10 +188,10 @@ def control_worker(s, workers_per_trigger=1, trigger_count=1, trigger_period=0, 
                             print('... Queuing function id={} ...'.format(i))
                         ids.add(i)
                         ready.append((i, r))
-                        if len(ids) == workers_per_trigger * trigger_count:
+                        if len(ids) == batch_size * num_batches:
                             run = False
                         else:
-                            print('.. Progress {}/{}'.format(len(ids), workers_per_trigger * trigger_count))
+                            print('.. Progress {}/{}'.format(len(ids), batch_size * num_batches))
                     else:
                         if log:
                             print('... Aborting function id={} ...'.format(i))
@@ -205,16 +201,16 @@ def control_worker(s, workers_per_trigger=1, trigger_count=1, trigger_period=0, 
 
     print('.. Starting benchmark ..')
     ready.sort(key=lambda x: x[0])
-    for t in range(trigger_count):
-        for idx in range(t * workers_per_trigger, (t + 1) * workers_per_trigger):
+    for t in range(num_batches):
+        for idx in range(t * batch_size, (t + 1) * batch_size):
             i, sock = ready[idx]
             if log:
                 print('... Running function id={} ...'.format(i))
             sock.send(b('RUN'))
         if log:
             print('.. End of wave ..')
-            print('.. Sleeping for {}s ..'.format(trigger_period))
-        time.sleep(trigger_period)
+            print('.. Sleeping for {}s ..'.format(batch_delay))
+        time.sleep(batch_delay)
     s.close()
 
 
@@ -227,11 +223,11 @@ def log_process(host, port, num_loggers=1, log=True):
     return p
 
 
-def control_process(host, port, workers_per_trigger=1, trigger_count=1, trigger_period=0, log=True):
+def control_process(host, port, batch_size=1, num_batches=1, batch_delay=0, log=True):
     s = run_server(host, port)
     if log:
         print('... Control server listening on {}:{} ...'.format(host, port))
-    p = Process(target=control_worker, args=(s, workers_per_trigger, trigger_count, trigger_period, log))
+    p = Process(target=control_worker, args=(s, batch_size, num_batches, batch_delay, log))
     p.start()
     return p
 
@@ -252,7 +248,7 @@ def main():
     parser.add_argument('--quieter', action='store_true', help='Suppress all logs')
     parser.add_argument('--host', type=str, default=socket.gethostname(), help='name of host where script is run')
     parser.add_argument('--port', type=int, default=8888, help='port that server listens on')
-    parser.add_argument('--num-ops', type=int, default=-1, help='number of operations')
+    parser.add_argument('--num-ops', type=int, default=DEFAULT_NUM_OPS, help='number of operations')
     parser.add_argument('--obj-size', type=int, default=8, help='object size to benchmark for')
     parser.add_argument('--mode', type=str, default='write_read', help='benchmark mode' + m_help)
     args = parser.parse_args()
@@ -274,29 +270,29 @@ def main():
         host = args.host
         log_port = args.port
         control_port = log_port + 1
-        if args.num_ops == -1:
-            args.num_ops = num_ops(args.system, args.obj_size)
         if args.mode.startswith('scale'):
-            _, mode, workers_per_trigger, trigger_period, num_triggers = args.mode.split(':')
-            workers_per_trigger = int(workers_per_trigger)
-            trigger_period = int(trigger_period)
-            num_triggers = int(num_triggers)
-            num_functions = workers_per_trigger * num_triggers
+            _, mode, batch_size, batch_delay, num_batches = args.mode.split(':')
+            batch_size = int(batch_size)
+            batch_delay = int(batch_delay)
+            num_batches = int(num_batches)
+            num_functions = batch_size * num_batches
             print('.. Number of functions to launch = {} ..'.format(num_functions))
             lp = log_process(host, log_port, num_functions, log_function)
-            op = control_process(host, control_port, workers_per_trigger, num_triggers, trigger_period, log_control)
-            processes = invoke_n(args, mode, num_functions)
+            op = control_process(host, control_port, batch_size, num_batches, batch_delay, log_control)
+            processes = invoke_n(args, mode, num_functions, batch_size)
             processes.append(lp)
             processes.append(op)
         else:
             lp = log_process(host, log_port)
             op = control_process(host, control_port)
-            processes = [invoke(args, args.mode, 1), lp, op]
+            processes = [invoke(args, args.mode, register_pocket_job("job-0")), lp, op]
 
         for p in processes:
             if p is not None:
                 p.join()
                 print('... {} terminated ...'.format(p))
+
+        deregister_pocket_jobs()
 
 
 if __name__ == '__main__':
