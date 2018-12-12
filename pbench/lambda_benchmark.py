@@ -52,7 +52,7 @@ def create_function(name):
 
 def register_pocket_job(job_name="job-0"):
     if job_name not in job_ids:
-        job_ids[job_name] = pocket.register_job(job_name)
+        job_ids[job_name] = pocket.register_job(job_name, capacityGB=10, peakMbps=8000)
     return job_ids[job_name]
 
 
